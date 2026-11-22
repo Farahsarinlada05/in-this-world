@@ -132,7 +132,7 @@
     <div class="scrubwrap"><div class="ticks" id="ticks"></div>
       <input type="range" id="scrub" min="0" max="105" step="0.001" value="0" aria-label="Episode timeline"></div>
     <span class="mono" id="time">00:00.0 / 01:45.0</span>
-    <span title="Volume">🔊</span><input class="vol" type="range" id="vol" min="0" max="1" step="0.01" value="0.9" aria-label="Volume">
+    <span title="Volume" id="volIcon">🔊</span><input class="vol" type="range" id="vol" min="0" max="1" step="0.01" value="0.9" aria-label="Volume">
     <button id="btnFull" title="Fullscreen (F)">⛶</button>
   </div>
   <div class="sceneinfo"><span id="sceneLabel"><b>Scene 1/12</b> · Awakening</span><span class="mono" id="sceneTime">00:00–00:07</span></div>
@@ -159,6 +159,7 @@
     </div>
     <label class="row small"><input type="checkbox" id="sfxOn" checked> Synthesized sound effects (room tone, steps, door, phone, wind, drones)</label>
     <div id="audioStatus" class="small muted">No dialogue WAV loaded — dialogue is never generated.</div>
+    <div id="wavWarnings" class="small status-warn"></div>
   </section>
 
   <section>
@@ -1620,11 +1621,16 @@ function ensureAudioCtx() {
   try { AUDIO.ctx = new AudioContext({ sampleRate: CONFIG.sampleRate }); } catch { AUDIO.ctx = new AudioContext(); }
   AUDIO.gain = AUDIO.ctx.createGain(); AUDIO.gain.connect(AUDIO.ctx.destination); applyVolume(); return AUDIO.ctx;
 }
-function applyVolume() { if (AUDIO.gain) AUDIO.gain.gain.value = AUDIO.muted ? 0 : AUDIO.volume; }
+// The player's volume/mute is the single source of truth for both playback and export loudness.
+const outputGain = () => (AUDIO.muted ? 0 : AUDIO.volume);
+function applyVolume() {
+  if (AUDIO.gain) AUDIO.gain.gain.value = outputGain();
+  const icon = $('volIcon'); if (icon) icon.textContent = outputGain() === 0 ? '🔇' : '🔊';
+}
 function stopAudio() { if (AUDIO.src) { try { AUDIO.src.stop(); } catch {} AUDIO.src.disconnect(); AUDIO.src = null; } }
 function startAudio(t) {
   stopAudio(); if (!AUDIO.ctx || !AUDIO.mix || t >= D - 0.01) return;
-  const s = AUDIO.ctx.createBufferSource(); s.buffer = AUDIO.mix; s.connect(AUDIO.gain); if (AUDIO.extraDest) s.connect(AUDIO.extraDest);
+  const s = AUDIO.ctx.createBufferSource(); s.buffer = AUDIO.mix; s.connect(AUDIO.gain);   // the recorder (fallback export) taps AUDIO.gain, so volume applies once
   s.start(0, t); AUDIO.src = s; AUDIO.srcCtx0 = AUDIO.ctx.currentTime; AUDIO.srcT0 = t;
 }
 const audioClock = () => AUDIO.src && AUDIO.ctx.state === 'running' ? AUDIO.srcT0 + (AUDIO.ctx.currentTime - AUDIO.srcCtx0) : null;
@@ -1705,18 +1711,37 @@ SCENES.forEach((sc, i) => {
   li.onclick = e => { if (!e.target.closest('label')) seek(sc.t0); };
   const inp = li.querySelector('input'), lab = li.querySelector('label');
   inp.addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-    try { AUDIO.sceneWavs[i] = await decodeWavFile(f); lab.firstChild.textContent = '✓WAV'; lab.classList.add('ok'); lab.title = `${f.name} · ${AUDIO.sceneWavs[i].buffer.duration.toFixed(2)} s at ${fmtMS(sc.t0)}`; rebuildMix(); }
+    try { AUDIO.sceneWavs[i] = await decodeWavFile(f); const warn = sceneWavWarning(i);
+      lab.firstChild.textContent = warn ? '⚠WAV' : '✓WAV'; lab.classList.toggle('ok', !warn); lab.classList.toggle('status-warn', !!warn);
+      lab.title = `${f.name} · ${AUDIO.sceneWavs[i].buffer.duration.toFixed(2)} s at ${fmtMS(sc.t0)}${warn ? '\n' + warn : ''}`; renderWavWarnings(); rebuildMix(); }
     catch (err) { setAudioStatus(err.message, 'err'); } });
   sceneList.appendChild(li);
   if (i > 0) { const tk = document.createElement('i'); tk.style.left = `${(sc.t0 / D) * 100}%`; $('ticks').appendChild(tk); }
 });
+// Scene WAV longer than its scene → warn (never trims or deletes; the user may want it to carry on).
+// The full-episode WAV is deliberately not checked: it is meant to span the whole timeline.
+function sceneWavWarning(i) {
+  const w = AUDIO.sceneWavs[i]; if (!w) return null;
+  const sc = SCENES[i], len = sc.t1 - sc.t0, dur = w.buffer.duration, over = dur - len;
+  if (over <= 0.01) return null;
+  const next = SCENES[i + 1];
+  const tail = next ? `The audio may overlap with Scene ${next.n} (${next.title}).`
+    : `Scene ${sc.n} is the last scene, so audio after ${fmtTime(D)} will be cut off at the end of the episode.`;
+  return `Warning: Scene ${sc.n} audio is ${dur.toFixed(2)} seconds long, but the scene duration is only ${len} seconds ` +
+    `(maximum recommended: ${len.toFixed(2)} s). It runs ${over.toFixed(2)} s past the end of the scene. ${tail} The WAV has been kept as uploaded.`;
+}
+function renderWavWarnings() {
+  const msgs = AUDIO.sceneWavs.map((_, i) => sceneWavWarning(i)).filter(Boolean);
+  const el = $('wavWarnings'); el.innerHTML = '';
+  for (const m of msgs) { const d = document.createElement('div'); d.textContent = '⚠ ' + m; d.style.marginTop = '4px'; el.appendChild(d); }
+}
 function setAudioStatus(msg, kind = '') { const el = $('audioStatus'); el.className = 'small ' + (kind ? 'status-' + kind : 'muted'); el.textContent = msg; }
 $('fullWav').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   try { AUDIO.fullWav = await decodeWavFile(f); const d = AUDIO.fullWav.buffer.duration;
     setAudioStatus(`Loaded ${f.name} (${d.toFixed(2)} s)${d > D + 0.05 ? ` — longer than the episode; audio after ${fmtTime(D)} is cut` : ''}`); rebuildMix(); }
   catch (err) { setAudioStatus(err.message, 'err'); } });
 $('btnClearAudio').onclick = () => { AUDIO.fullWav = null; AUDIO.sceneWavs.fill(null);
-  document.querySelectorAll('#sceneList label.wav').forEach(l => { l.firstChild.textContent = '+WAV'; l.classList.remove('ok'); }); rebuildMix(); };
+  document.querySelectorAll('#sceneList label.wav').forEach(l => { l.firstChild.textContent = '+WAV'; l.classList.remove('ok', 'status-warn'); }); renderWavWarnings(); rebuildMix(); };
 $('sfxOn').addEventListener('change', e => { AUDIO.sfxOn = e.target.checked; rebuildMix(); });
 function updateSubStatus(extra = '') { const n = CUES.length; $('subStatus').textContent = `${n} cue${n === 1 ? '' : 's'} active${extra}. Prefix a line with "AVA:" / "MILO:" to drive that character's mouth from the WAV.`; }
 $('srtInput').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return;
@@ -1817,9 +1842,11 @@ async function exportEpisode({ from = 0, to = D } = {}) {
     const aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { error = e; } });
     aenc.configure({ codec: fmt.aCodec, sampleRate: sr, numberOfChannels: 2, bitrate: audioBitrate });
     const L = AUDIO.mix.getChannelData(0), R = AUDIO.mix.numberOfChannels > 1 ? AUDIO.mix.getChannelData(1) : L;
+    const gain = outputGain();   // read once so the whole file has one consistent level (muted → silent track, still in sync)
     const aStart = Math.floor(from * sr), aEnd = Math.min(L.length, Math.floor(to * sr)); let aPos = aStart;
     const encodeAudioUntil = tEnd => { const lim = Math.min(aEnd, Math.floor(tEnd * sr));
       while (aPos < lim) { const n = Math.min(1024, lim - aPos), buf = new Float32Array(n * 2); buf.set(L.subarray(aPos, aPos + n), 0); buf.set(R.subarray(aPos, aPos + n), n);
+        if (gain !== 1) for (let k = 0; k < buf.length; k++) buf[k] *= gain;
         const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: 2, timestamp: Math.round((aPos - aStart) / sr * 1e6), data: buf });
         aenc.encode(ad); ad.close(); aPos += n; } };
     setRenderSize(W, H, 1);
@@ -1842,7 +1869,7 @@ async function exportEpisode({ from = 0, to = D } = {}) {
     await venc.flush(); await aenc.flush(); if (error) throw error;
     muxer.finalize(); venc.close(); aenc.close();
     const blob = new Blob([muxer.target.buffer], { type: fmt.mime });
-    await showExportResult(blob, fmt, to - from, (performance.now() - t0wall) / 1000);
+    await showExportResult(blob, fmt, to - from, (performance.now() - t0wall) / 1000, gain);
   } catch (e) {
     status.className = 'small status-err'; status.textContent = 'Export failed: ' + (e.message || e); if (e.message !== 'Export cancelled') reportError('Export failed: ' + (e.stack || e));
   } finally {
@@ -1851,7 +1878,8 @@ async function exportEpisode({ from = 0, to = D } = {}) {
   }
 }
 function findBytes(u8, str, limit = u8.length) { const b = [...str].map(c => c.charCodeAt(0)); outer: for (let i = 0; i < Math.min(limit, u8.length) - b.length; i++) { for (let j = 0; j < b.length; j++) if (u8[i + j] !== b[j]) continue outer; return true; } return false; }
-async function showExportResult(blob, fmt, expectDur, secs) {
+async function showExportResult(blob, fmt, expectDur, secs, gain) {
+  const volNote = gain === undefined ? '' : gain === 0 ? ' Audio exported silent (player muted).' : ` Audio exported at ${Math.round(gain * 100)}% volume.`;
   const url = URL.createObjectURL(blob), name = `IN_THIS_WORLD_EP01_1080x1920.${fmt.ext}`;
   const u8 = new Uint8Array(await blob.slice(0, Math.min(blob.size, 4 << 20)).arrayBuffer());
   const hasAudio = fmt.container === 'mp4' ? findBytes(u8, 'mp4a') || findBytes(u8, 'Opus') : findBytes(u8, 'A_OPUS');
@@ -1861,7 +1889,7 @@ async function showExportResult(blob, fmt, expectDur, secs) {
   const st = $('exportStatus');
   st.className = 'small ' + (meta && okDur && okSize && hasAudio ? 'status-ok' : 'status-warn');
   st.innerHTML = `${meta && okDur && okSize && hasAudio ? '✓' : '⚠'} ${fmt.label} · ${(blob.size / 1048576).toFixed(1)} MB · encoded in ${secs.toFixed(0)} s<br>` +
-    `Verified by the browser: duration ${meta ? meta.d.toFixed(2) + ' s' : 'unreadable'} (expected ${expectDur.toFixed(2)}), ${meta ? meta.w + '×' + meta.h : '?'}, audio track ${hasAudio ? 'present' : 'NOT found'}.`;
+    `Verified by the browser: duration ${meta ? meta.d.toFixed(2) + ' s' : 'unreadable'} (expected ${expectDur.toFixed(2)}), ${meta ? meta.w + '×' + meta.h : '?'}, audio track ${hasAudio ? 'present' : 'NOT found'}.${volNote}`;
   const box_ = $('exportResult'); box_.innerHTML = ''; box_.appendChild(v);
   const a = document.createElement('a'); a.href = url; a.download = name; a.textContent = `⬇ Download ${name}`; a.style.display = 'block'; a.style.marginTop = '6px'; a.style.color = '#e4e7ec'; box_.appendChild(a);
   window.EP.lastExport = { blob, url, name, meta, hasAudio, fmt: fmt.label, seconds: secs };
@@ -1875,7 +1903,8 @@ async function exportRealtime() {
   if (!mime) { $('exportStatus').textContent = 'MediaRecorder supports no usable video format here.'; return; }
   pause(); ensureAudioCtx(); await AUDIO.ctx.resume(); if (AUDIO.rendering) await AUDIO.rendering;
   await document.fonts.load(`500 48px "Noto Sans Thai"`, 'ก').catch(() => {});
-  const dest = AUDIO.ctx.createMediaStreamDestination(); AUDIO.extraDest = dest;
+  // Record from the player's gain node: the recording follows the volume slider / mute, and there is only one audio path.
+  const dest = AUDIO.ctx.createMediaStreamDestination(); AUDIO.gain.connect(dest); AUDIO.extraDest = dest;
   const stream = comp.captureStream(CONFIG.fps); dest.stream.getAudioTracks().forEach(tr => stream.addTrack(tr));
   const chunks = [], rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: CONFIG.output.videoBitrate });
   rec.ondataavailable = e => e.data.size && chunks.push(e.data);
@@ -1883,9 +1912,10 @@ async function exportRealtime() {
   setRenderSize(CONFIG.output.width, CONFIG.output.height, 1);
   RT.draw = t => { compCtx.drawImage(renderer.domElement, 0, 0, comp.width, comp.height); drawOverlays(compCtx, t, comp.width, comp.height, burn); };
   RT.stop = () => rec.state !== 'inactive' && rec.stop();
-  rec.onstop = async () => { RT.rec = null; AUDIO.extraDest = null; setRenderSize(viewport.clientWidth, viewport.clientHeight, prevPR); resize();
+  const gainAtStart = outputGain();
+  rec.onstop = async () => { RT.rec = null; try { AUDIO.gain.disconnect(dest); } catch {} AUDIO.extraDest = null; setRenderSize(viewport.clientWidth, viewport.clientHeight, prevPR); resize();
     const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
-    await showExportResult(new Blob(chunks, { type: mime.split(';')[0] }), { container: ext, ext, label: `${ext.toUpperCase()} (real-time MediaRecorder)` }, D, (performance.now() - t0) / 1000); };
+    await showExportResult(new Blob(chunks, { type: mime.split(';')[0] }), { container: ext, ext, label: `${ext.toUpperCase()} (real-time MediaRecorder)` }, RT.expectDur ?? D, (performance.now() - t0) / 1000, gainAtStart); };
   RT.rec = rec; rec.start(1000); $('exportStatus').textContent = 'Recording the episode in real time (105 s)…'; T.time = 0; play();
 }
 $('btnExport').onclick = () => exportEpisode();
@@ -1955,7 +1985,7 @@ async function boot() {
 }
 boot();
 
-window.EP = { seek, play, pause, restart, get time() { return T.time; }, renderAt, renderComposite, exportEpisode, actors, stage, lights, scene, camera, renderer, SHOTS: () => SHOTS, CONFIG, AUDIO, comp, setRenderSize };
+window.EP = { seek, play, pause, restart, get time() { return T.time; }, renderAt, renderComposite, exportEpisode, exportRealtime, RT, actors, stage, lights, scene, camera, renderer, SHOTS: () => SHOTS, CONFIG, AUDIO, comp, setRenderSize };
 </script>
 </body>
 </html>
